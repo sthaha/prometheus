@@ -771,7 +771,7 @@ func (ng *Engine) populateSeries(querier storage.Querier, s *parser.EvalStmt) {
 			}
 			evalRange = 0
 			hints.By, hints.Grouping = extractGroupsFromPath(path)
-			n.UnexpandedSeriesSet = querier.Select(false, hints, n.LabelMatchers...)
+			n.SeriesSet = querier.Select(false, hints, n.LabelMatchers...)
 
 		case *parser.MatrixSelector:
 			evalRange = n.Range
@@ -811,22 +811,22 @@ func extractGroupsFromPath(p []parser.Node) (bool, []string) {
 	return false, nil
 }
 
-func checkAndExpandSeriesSet(ctx context.Context, expr parser.Expr) (storage.Warnings, error) {
+func xcheckAndExpandSeriesSet(ctx context.Context, expr parser.Expr) (storage.Warnings, error) {
 	switch e := expr.(type) {
 	case *parser.MatrixSelector:
-		return checkAndExpandSeriesSet(ctx, e.VectorSelector)
+		return xcheckAndExpandSeriesSet(ctx, e.VectorSelector)
 	case *parser.VectorSelector:
-		if e.Series != nil {
+		if e.SeriesSet != nil {
 			return nil, nil
 		}
-		series, ws, err := expandSeriesSet(ctx, e.UnexpandedSeriesSet)
-		e.Series = series
+		series, ws, err := xexpandSeriesSet(ctx, e.XUnexpandedSeriesSet)
+		e.XSeries = series
 		return ws, err
 	}
 	return nil, nil
 }
 
-func expandSeriesSet(ctx context.Context, it storage.SeriesSet) (res []storage.Series, ws storage.Warnings, err error) {
+func xexpandSeriesSet(ctx context.Context, it storage.SeriesSet) (res []storage.Series, ws storage.Warnings, err error) {
 	for it.Next() {
 		select {
 		case <-ctx.Done():
@@ -1139,7 +1139,7 @@ func (ev *evaluator) evalSubquery(subq *parser.SubqueryExpr) (*parser.MatrixSele
 	vs := &parser.VectorSelector{
 		OriginalOffset: subq.OriginalOffset,
 		Offset:         subq.Offset,
-		Series:         make([]storage.Series, 0, len(mat)),
+		XSeries:        make([]storage.Series, 0, len(mat)),
 		Timestamp:      subq.Timestamp,
 	}
 	if subq.Timestamp != nil {
@@ -1154,7 +1154,7 @@ func (ev *evaluator) evalSubquery(subq *parser.SubqueryExpr) (*parser.MatrixSele
 	totalSamples := 0
 	for _, s := range mat {
 		totalSamples += len(s.Points)
-		vs.Series = append(vs.Series, NewStorageSeries(s))
+		vs.XSeries = append(vs.XSeries, NewStorageSeries(s))
 	}
 	return ms, totalSamples, ws
 }
@@ -1245,7 +1245,7 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, storage.Warnings) {
 				warnings = append(warnings, ws...)
 				defer func() {
 					// subquery result takes space in the memory. Get rid of that at the end.
-					val.VectorSelector.(*parser.VectorSelector).Series = nil
+					val.VectorSelector.(*parser.VectorSelector).XSeries = nil
 					ev.currentSamples -= totalSamples
 				}()
 				break
@@ -1275,12 +1275,15 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, storage.Warnings) {
 		sel := unwrapStepInvariantExpr(e.Args[matrixArgIndex]).(*parser.MatrixSelector)
 		selVS := sel.VectorSelector.(*parser.VectorSelector)
 
-		ws, err := checkAndExpandSeriesSet(ev.ctx, sel)
-		warnings = append(warnings, ws...)
-		if err != nil {
-			ev.error(errWithWarnings{errors.Wrap(err, "expanding series"), warnings})
-		}
-		mat := make(Matrix, 0, len(selVS.Series)) // Output matrix.
+		// ws, err := checkAndExpandSeriesSet(ev.ctx, sel)
+		// warnings = append(warnings, ws...)
+		// if err != nil {
+		// ev.error(errWithWarnings{errors.Wrap(err, "expanding series"), warnings})
+		// }
+
+		// mat := make(Matrix, 0, len(selVS.Series)) // Output matrix.
+		mat := make(Matrix, 0, 10) // Output matrix.
+
 		offset := durationMilliseconds(selVS.Offset)
 		selRange := durationMilliseconds(sel.Range)
 		stepRange := selRange
@@ -1294,11 +1297,15 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, storage.Warnings) {
 		enh := &EvalNodeHelper{Out: make(Vector, 0, 1)}
 		// Process all the calls for one time series at a time.
 		it := storage.NewBuffer(selRange)
-		for i, s := range selVS.Series {
+
+		// for i, s := range selVS.SeriesSet {
+		for selVS.SeriesSet.Next() {
+			series := selVS.SeriesSet.At()
+
 			ev.currentSamples -= len(points)
 			points = points[:0]
-			it.Reset(s.Iterator())
-			metric := selVS.Series[i].Labels()
+			it.Reset(series.Iterator())
+			metric := series.Labels()
 			// The last_over_time function acts like offset; thus, it
 			// should keep the metric name.  For all the other range
 			// vector functions, the only change needed is to drop the
@@ -1310,7 +1317,7 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, storage.Warnings) {
 				Metric: metric,
 				Points: getPointSlice(numSteps),
 			}
-			inMatrix[0].Metric = selVS.Series[i].Labels()
+			inMatrix[0].Metric = series.Labels()
 			for ts, step := ev.startTimestamp, -1; ts <= ev.endTimestamp; ts += ev.interval {
 				step++
 				// Set the non-matrix arguments.
@@ -1464,16 +1471,18 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, storage.Warnings) {
 		return String{V: e.Val, T: ev.startTimestamp}, nil
 
 	case *parser.VectorSelector:
-		ws, err := checkAndExpandSeriesSet(ev.ctx, e)
-		if err != nil {
-			ev.error(errWithWarnings{errors.Wrap(err, "expanding series"), ws})
-		}
-		mat := make(Matrix, 0, len(e.Series))
+		// ws, err := checkAndExpandSeriesSet(ev.ctx, e)
+		// if err != nil {
+		// ev.error(errWithWarnings{errors.Wrap(err, "expanding series"), ws})
+		// }
+		mat := make(Matrix, 0, 16)
 		it := storage.NewMemoizedEmptyIterator(durationMilliseconds(ev.lookbackDelta))
-		for i, s := range e.Series {
+		// for i, s := range e.Series {
+		for e.SeriesSet.Next() {
+			s := e.SeriesSet.At()
 			it.Reset(s.Iterator())
 			ss := Series{
-				Metric: e.Series[i].Labels(),
+				Metric: s.Labels(),
 				Points: getPointSlice(numSteps),
 			}
 
@@ -1495,7 +1504,7 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, storage.Warnings) {
 				putPointSlice(ss.Points)
 			}
 		}
-		return mat, ws
+		return mat, e.SeriesSet.Warnings()
 
 	case *parser.MatrixSelector:
 		if ev.startTimestamp != ev.endTimestamp {
@@ -1595,19 +1604,23 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, storage.Warnings) {
 
 // vectorSelector evaluates a *parser.VectorSelector expression.
 func (ev *evaluator) vectorSelector(node *parser.VectorSelector, ts int64) (Vector, storage.Warnings) {
-	ws, err := checkAndExpandSeriesSet(ev.ctx, node)
-	if err != nil {
-		ev.error(errWithWarnings{errors.Wrap(err, "expanding series"), ws})
-	}
-	vec := make(Vector, 0, len(node.Series))
+	// ws, err := xcheckAndExpandSeriesSet(ev.ctx, node)
+	// if err != nil {
+	// ev.error(errWithWarnings{errors.Wrap(err, "expanding series"), ws})
+	// }
+	// vec := make(Vector, 0, 10) //len(node.Series))
+	vec := make(Vector, 0, 10)
 	it := storage.NewMemoizedEmptyIterator(durationMilliseconds(ev.lookbackDelta))
-	for i, s := range node.Series {
+	// for i, s := range node.Series {
+	for node.SeriesSet.Next() {
+		s := node.SeriesSet.At()
 		it.Reset(s.Iterator())
 
 		t, v, ok := ev.vectorSelectorSingle(it, node, ts)
 		if ok {
 			vec = append(vec, Sample{
-				Metric: node.Series[i].Labels(),
+				// Metric: node.Series[i].Labels(),
+				Metric: s.Labels(),
 				Point:  Point{V: v, T: t},
 			})
 
@@ -1618,7 +1631,7 @@ func (ev *evaluator) vectorSelector(node *parser.VectorSelector, ts int64) (Vect
 		}
 
 	}
-	return vec, ws
+	return vec, node.SeriesSet.Warnings()
 }
 
 // vectorSelectorSingle evaluates a instant vector for the iterator of one time series.
@@ -1673,23 +1686,27 @@ func (ev *evaluator) matrixSelector(node *parser.MatrixSelector) (Matrix, storag
 		offset = durationMilliseconds(vs.Offset)
 		maxt   = ev.startTimestamp - offset
 		mint   = maxt - durationMilliseconds(node.Range)
-		matrix = make(Matrix, 0, len(vs.Series))
+		// matrix = make(Matrix, 0, len(vs.Series))
+		matrix = make(Matrix, 0, 10)
 
 		it = storage.NewBuffer(durationMilliseconds(node.Range))
 	)
-	ws, err := checkAndExpandSeriesSet(ev.ctx, node)
-	if err != nil {
-		ev.error(errWithWarnings{errors.Wrap(err, "expanding series"), ws})
-	}
+	// ws, err := checkAndExpandSeriesSet(ev.ctx, node)
+	// if err != nil {
+	// ev.error(errWithWarnings{errors.Wrap(err, "expanding series"), ws})
+	// }
 
-	series := vs.Series
-	for i, s := range series {
-		if err := contextDone(ev.ctx, "expression evaluation"); err != nil {
-			ev.error(err)
-		}
+	// series := vs.Series
+	// for i, s := range series {
+	for vs.SeriesSet.Next() {
+		// if err := contextDone(ev.ctx, "expression evaluation"); err != nil {
+		// ev.error(err)
+		// }
+		s := vs.SeriesSet.At()
 		it.Reset(s.Iterator())
+
 		ss := Series{
-			Metric: series[i].Labels(),
+			Metric: s.Labels(),
 		}
 
 		ss.Points = ev.matrixIterSlice(it, mint, maxt, getPointSlice(16))
@@ -1700,7 +1717,7 @@ func (ev *evaluator) matrixSelector(node *parser.MatrixSelector) (Matrix, storag
 			putPointSlice(ss.Points)
 		}
 	}
-	return matrix, ws
+	return matrix, vs.SeriesSet.Warnings()
 }
 
 // matrixIterSlice populates a matrix vector covering the requested range for a
