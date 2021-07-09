@@ -811,32 +811,32 @@ func extractGroupsFromPath(p []parser.Node) (bool, []string) {
 	return false, nil
 }
 
-func xcheckAndExpandSeriesSet(ctx context.Context, expr parser.Expr) (storage.Warnings, error) {
-	switch e := expr.(type) {
-	case *parser.MatrixSelector:
-		return xcheckAndExpandSeriesSet(ctx, e.VectorSelector)
-	case *parser.VectorSelector:
-		if e.SeriesSet != nil {
-			return nil, nil
-		}
-		series, ws, err := xexpandSeriesSet(ctx, e.XUnexpandedSeriesSet)
-		e.XSeries = series
-		return ws, err
-	}
-	return nil, nil
-}
-
-func xexpandSeriesSet(ctx context.Context, it storage.SeriesSet) (res []storage.Series, ws storage.Warnings, err error) {
-	for it.Next() {
-		select {
-		case <-ctx.Done():
-			return nil, nil, ctx.Err()
-		default:
-		}
-		res = append(res, it.At())
-	}
-	return res, it.Warnings(), it.Err()
-}
+// func xcheckAndExpandSeriesSet(ctx context.Context, expr parser.Expr) (storage.Warnings, error) {
+// 	switch e := expr.(type) {
+// 	case *parser.MatrixSelector:
+// 		return xcheckAndExpandSeriesSet(ctx, e.VectorSelector)
+// 	case *parser.VectorSelector:
+// 		if e.SeriesSet != nil {
+// 			return nil, nil
+// 		}
+// 		series, ws, err := xexpandSeriesSet(ctx, e.XUnexpandedSeriesSet)
+// 		e.XSeries = series
+// 		return ws, err
+// 	}
+// 	return nil, nil
+// }
+//
+// func xexpandSeriesSet(ctx context.Context, it storage.SeriesSet) (res []storage.Series, ws storage.Warnings, err error) {
+// 	for it.Next() {
+// 		select {
+// 		case <-ctx.Done():
+// 			return nil, nil, ctx.Err()
+// 		default:
+// 		}
+// 		res = append(res, it.At())
+// 	}
+// 	return res, it.Warnings(), it.Err()
+// }
 
 type errWithWarnings struct {
 	err      error
@@ -1139,8 +1139,8 @@ func (ev *evaluator) evalSubquery(subq *parser.SubqueryExpr) (*parser.MatrixSele
 	vs := &parser.VectorSelector{
 		OriginalOffset: subq.OriginalOffset,
 		Offset:         subq.Offset,
-		XSeries:        make([]storage.Series, 0, len(mat)),
-		Timestamp:      subq.Timestamp,
+		// XSeries:        make([]storage.Series, 0, len(mat)),
+		Timestamp: subq.Timestamp,
 	}
 	if subq.Timestamp != nil {
 		// The offset of subquery is not modified in case of @ modifier.
@@ -1300,12 +1300,12 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, storage.Warnings) {
 
 		// for i, s := range selVS.SeriesSet {
 		for selVS.SeriesSet.Next() {
-			series := selVS.SeriesSet.At()
+			s := selVS.SeriesSet.At()
 
 			ev.currentSamples -= len(points)
 			points = points[:0]
-			it.Reset(series.Iterator())
-			metric := series.Labels()
+			it.Reset(s.Iterator())
+			metric := s.Labels()
 			// The last_over_time function acts like offset; thus, it
 			// should keep the metric name.  For all the other range
 			// vector functions, the only change needed is to drop the
@@ -1317,7 +1317,7 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, storage.Warnings) {
 				Metric: metric,
 				Points: getPointSlice(numSteps),
 			}
-			inMatrix[0].Metric = series.Labels()
+			inMatrix[0].Metric = s.Labels()
 			for ts, step := ev.startTimestamp, -1; ts <= ev.endTimestamp; ts += ev.interval {
 				step++
 				// Set the non-matrix arguments.
