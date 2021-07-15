@@ -258,6 +258,7 @@ func TestSelectHintsSetCorrectly(t *testing.T) {
 
 	for _, tc := range []struct {
 		query string
+		run   bool
 
 		// All times are in milliseconds.
 		start int64
@@ -316,6 +317,7 @@ func TestSelectHintsSetCorrectly(t *testing.T) {
 			{Start: 175000, End: 300000},
 		},
 	}, {
+		run:   true,
 		query: "count_over_time(foo[2m:1s])", start: 300000,
 		expected: []*storage.SelectHints{
 			{Start: 175000, End: 300000, Func: "count_over_time"},
@@ -537,6 +539,12 @@ func TestSelectHintsSetCorrectly(t *testing.T) {
 		},
 	},
 	} {
+		if !tc.run {
+			// t.Logf("skipping: %s ", tc.query)
+			continue
+		}
+
+		t.Logf("Running: %s | %v", tc.query, tc.end)
 		t.Run(tc.query, func(t *testing.T) {
 			engine := NewEngine(opts)
 			hintsRecorder := &noopHintRecordingQueryable{}

@@ -196,7 +196,7 @@ type VectorSelector struct {
 	LabelMatchers []*labels.Matcher
 
 	// The unexpanded seriesSet populated at query preparation time.
-	XSeries []storage.Series
+	// XSeries []storage.Series
 
 	SeriesSet storage.SeriesSet
 

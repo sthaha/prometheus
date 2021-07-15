@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 	"reflect"
 	"regexp"
 	"runtime"
@@ -27,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/davecgh/go-spew/spew"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/opentracing/opentracing-go"
@@ -811,33 +813,6 @@ func extractGroupsFromPath(p []parser.Node) (bool, []string) {
 	return false, nil
 }
 
-// func xcheckAndExpandSeriesSet(ctx context.Context, expr parser.Expr) (storage.Warnings, error) {
-// 	switch e := expr.(type) {
-// 	case *parser.MatrixSelector:
-// 		return xcheckAndExpandSeriesSet(ctx, e.VectorSelector)
-// 	case *parser.VectorSelector:
-// 		if e.SeriesSet != nil {
-// 			return nil, nil
-// 		}
-// 		series, ws, err := xexpandSeriesSet(ctx, e.XUnexpandedSeriesSet)
-// 		e.XSeries = series
-// 		return ws, err
-// 	}
-// 	return nil, nil
-// }
-//
-// func xexpandSeriesSet(ctx context.Context, it storage.SeriesSet) (res []storage.Series, ws storage.Warnings, err error) {
-// 	for it.Next() {
-// 		select {
-// 		case <-ctx.Done():
-// 			return nil, nil, ctx.Err()
-// 		default:
-// 		}
-// 		res = append(res, it.At())
-// 	}
-// 	return res, it.Warnings(), it.Err()
-// }
-
 type errWithWarnings struct {
 	err      error
 	warnings storage.Warnings
@@ -1133,7 +1108,8 @@ func (ev *evaluator) rangeEval(prepSeries func(labels.Labels, *EvalSeriesHelper)
 
 // evalSubquery evaluates given SubqueryExpr and returns an equivalent
 // evaluated MatrixSelector in its place. Note that the Name and LabelMatchers are not set.
-func (ev *evaluator) evalSubquery(subq *parser.SubqueryExpr) (*parser.MatrixSelector, int, storage.Warnings) {
+func (ev *evaluator) xevalSubquery(subq *parser.SubqueryExpr) (*parser.MatrixSelector, int, storage.Warnings) {
+
 	val, ws := ev.eval(subq)
 	mat := val.(Matrix)
 	vs := &parser.VectorSelector{
@@ -1147,18 +1123,129 @@ func (ev *evaluator) evalSubquery(subq *parser.SubqueryExpr) (*parser.MatrixSele
 		// Hence we take care of that here for the result.
 		vs.Offset = subq.OriginalOffset + time.Duration(ev.startTimestamp-*subq.Timestamp)*time.Millisecond
 	}
+
 	ms := &parser.MatrixSelector{
 		Range:          subq.Range,
 		VectorSelector: vs,
 	}
+	// // The unexpanded seriesSet populated at query preparation time.
+
+	series := make([]storage.Series, 0, len(mat))
 	totalSamples := 0
 	for _, s := range mat {
 		totalSamples += len(s.Points)
-		vs.XSeries = append(vs.XSeries, NewStorageSeries(s))
+		series = append(series, NewStorageSeries(s))
 	}
+
+	// vs.XSeries = series
 	return ms, totalSamples, ws
 }
 
+// evalSubquery evaluates given SubqueryExpr and returns an equivalent
+// evaluated MatrixSelector in its place. Note that the Name and LabelMatchers are not set.
+func (ev *evaluator) evalSubquery(subq *parser.SubqueryExpr) (*parser.MatrixSelector, int, storage.Warnings) {
+
+	fmt.Fprintf(os.Stderr, `
+	====[  eval subquery  ]========================================
+	vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+	%v
+	^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+	Stack:
+	----------------------------------------
+%s
+	___________________________________________________
+	`, spew.Sdump(subq), stacktrace(8))
+
+	val, ws := ev.eval(subq)
+	mat := val.(Matrix)
+	vs := &parser.VectorSelector{
+		OriginalOffset: subq.OriginalOffset,
+		Offset:         subq.Offset,
+		Timestamp:      subq.Timestamp,
+	}
+	if subq.Timestamp != nil {
+		// The offset of subquery is not modified in case of @ modifier.
+		// Hence we take care of that here for the result.
+		vs.Offset = subq.OriginalOffset + time.Duration(ev.startTimestamp-*subq.Timestamp)*time.Millisecond
+	}
+
+	ms := &parser.MatrixSelector{
+		Range:          subq.Range,
+		VectorSelector: vs,
+	}
+
+	matrixSeries := newSeriesSetFromMatrix(mat)
+	vs.SeriesSet = matrixSeries
+
+	return ms, mat.TotalSamples(), ws
+}
+
+// MatrixSelector represents a Vector selection of a Matrix
+type MatrixSeries struct {
+	matrix Matrix
+
+	// indicates if the matrix has been expanded into
+	index int
+}
+
+func (ms *MatrixSeries) Next() bool {
+	fmt.Fprintf(os.Stderr, `
+	====[ Next? matrix  ]========================================
+	vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+	Len: %d | at: %d | ??
+	^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+	Stack:
+	----------------------------------------
+	%s
+	___________________________________________________
+	`, len(ms.matrix), ms.index, stacktrace(5))
+
+	if ms.index+1 >= len(ms.matrix) {
+		return false
+	}
+
+	fmt.Fprintf(os.Stderr, `
+	====[ Next? true  ]========================================
+	vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+	Len: %d | at: %d | ??
+	^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+	Stack:
+	----------------------------------------
+	%s
+	___________________________________________________
+	`, len(ms.matrix), ms.index, stacktrace(3))
+	ms.index++
+	return true
+}
+
+func (ms *MatrixSeries) At() storage.Series {
+
+	fmt.Fprintf(os.Stderr, `
+	====[ At matrix  ]========================================
+	vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+	Len: %d | at: %d
+	^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+	Stack:
+	----------------------------------------
+	%s
+	___________________________________________________
+	`, len(ms.matrix), ms.index, stacktrace(10))
+	return NewStorageSeries(ms.matrix[ms.index])
+}
+
+func (ms *MatrixSeries) Err() error {
+	return nil
+}
+
+func (ms *MatrixSeries) Warnings() storage.Warnings {
+	return nil
+}
+
+func newSeriesSetFromMatrix(m Matrix) *MatrixSeries {
+	return &MatrixSeries{matrix: m, index: -1}
+}
+
+//
 // eval evaluates the given expression as the given AST expression node requires.
 func (ev *evaluator) eval(expr parser.Expr) (parser.Value, storage.Warnings) {
 	// This is the top-level evaluation method.
@@ -1227,6 +1314,18 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, storage.Warnings) {
 			matrixArg      bool
 			warnings       storage.Warnings
 		)
+
+		fmt.Fprintf(os.Stderr, `
+		====[ e.Args  ]========================================
+		vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+		%v
+		^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+		Stack:
+		----------------------------------------
+	%s
+		___________________________________________________
+		`, spew.Sdump(e.Args), stacktrace(5))
+
 		for i := range e.Args {
 			unwrapParenExpr(&e.Args[i])
 			a := unwrapStepInvariantExpr(e.Args[i])
@@ -1235,17 +1334,18 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, storage.Warnings) {
 				matrixArg = true
 				break
 			}
+
 			// parser.SubqueryExpr can be used in place of parser.MatrixSelector.
 			if subq, ok := a.(*parser.SubqueryExpr); ok {
 				matrixArgIndex = i
 				matrixArg = true
 				// Replacing parser.SubqueryExpr with parser.MatrixSelector.
-				val, totalSamples, ws := ev.evalSubquery(subq)
-				e.Args[i] = val
+				ms, totalSamples, ws := ev.evalSubquery(subq)
+				e.Args[i] = ms
 				warnings = append(warnings, ws...)
 				defer func() {
 					// subquery result takes space in the memory. Get rid of that at the end.
-					val.VectorSelector.(*parser.VectorSelector).XSeries = nil
+					// ms.VectorSelector.(*parser.VectorSelector).XSeries = nil
 					ev.currentSamples -= totalSamples
 				}()
 				break
@@ -1275,6 +1375,7 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, storage.Warnings) {
 		sel := unwrapStepInvariantExpr(e.Args[matrixArgIndex]).(*parser.MatrixSelector)
 		selVS := sel.VectorSelector.(*parser.VectorSelector)
 
+		// TODO(sthaha): remove this
 		// ws, err := checkAndExpandSeriesSet(ev.ctx, sel)
 		// warnings = append(warnings, ws...)
 		// if err != nil {
@@ -1282,6 +1383,7 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, storage.Warnings) {
 		// }
 
 		// mat := make(Matrix, 0, len(selVS.Series)) // Output matrix.
+		// TODO(sthaha): what's a good size??
 		mat := make(Matrix, 0, 10) // Output matrix.
 
 		offset := durationMilliseconds(selVS.Offset)
